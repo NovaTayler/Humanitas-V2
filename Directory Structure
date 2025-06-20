@@ -1,0 +1,16 @@
+dropshipping-bot/
+├── main.py
+├── requirements.txt
+├── Dockerfile
+├── templates/
+│   └── dashboard.html
+├── terraform/
+│   ├── main.tf
+│   ├── variables.tf
+│   └── outputs.tf
+├── .github/
+│   └── workflows/
+│       └── deploy.yml
+├── setup.sh
+├── secrets.json
+├── .env
