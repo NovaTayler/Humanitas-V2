@@ -1,0 +1,15 @@
+aiohttp==3.8.3
+asyncpg==0.29.0
+cryptography==42.0.5
+celery==5.3.6
+redis==5.0.3
+selenium==4.21.0
+webdriver-manager==4.0.2
+fake-useragent==1.5.1
+prometheus-client==0.20.0
+requests==2.32.3
+pydantic==2.7.1
+structlog==24.1.0
+python-telegram-bot==20.7
+python-dotenv==1.0.1
+flask==3.0.3
