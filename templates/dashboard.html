@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dropshipping Dashboard</title>
+    <style>
+        body { font-family: Arial; margin: 40px; }
+        table { background-color: #f2f2f2; }
+        th, td { border: 1px solid #ddd; padding: 8px; }
+        tr:nth-child(even) { background-color: #f9f9f9; }
+    </style>
+</head>
+<body>
+    <h1>Dropshipping Dashboard</h1>
+    <table>
+        <tr><th>Metric</th><th>Value</th></tr>
+        <tr><td>Accounts</td><td>{{ stats[1] }}</td></tr>
+        <tr><td>Listings</td><td>{{ stats[2] }}</td></tr>
+        <tr><td>Orders</td><td>{{ stats[3] }}</td></tr>
+        <tr><td>Revenue</td><td>${{ stats[4]:.2f }}</td></tr>
+        <tr><td>Profit</td><td>${{ stats[5]:.2f }}</td></tr>
+        <tr><td>Updated</td><td>{{ stats[6] }}</td></tr>
+    </table>
+</body>
+</html>
