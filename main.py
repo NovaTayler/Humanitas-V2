@@ -884,4 +884,5 @@ async def start_workflow():
     return {"status": "Workflow completed"}, 200
 
 if __name__ == "__main__":
-    app_flask.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 8080))
+    app_flask.run(host="0.0.0.0", port=port)
