@@ -538,8 +538,9 @@ def create_gmail_account(self) -> Tuple[str, str]:
         loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
         loop.run_until_complete(init_db())
-        async with get_db_connection() as conn:
-            loop.run_until_complete(conn.execute("INSERT OR REPLACE INTO email_accounts (email, password) VALUES ($1, $2)", email, password))
+        result = loop.run_until_complete(insert_email_account(email, password))
+        if not result:
+            raise Exception("Failed to insert email account")
         ACCOUNTS_CREATED.inc()
         secrets = {"GMAIL_EMAIL": email, "GMAIL_PASSWORD": password}
         secrets_manager.save_secrets(secrets)
@@ -550,6 +551,12 @@ def create_gmail_account(self) -> Tuple[str, str]:
     finally:
         driver.quit()
     return email, password
+
+async def insert_email_account(email: str, password: str) -> bool:
+    """Insert email account into database."""
+    async with get_db_connection() as conn:
+        await conn.execute("INSERT OR REPLACE INTO email_accounts (email, password) VALUES ($1, $2)", email, password)
+        return True
 
 @app_celery.task(bind=True)
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
@@ -614,11 +621,9 @@ def create_supplier_account(self, supplier: str, gmail_email: str, gmail_passwor
             loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
         api_key = loop.run_until_complete(fetch_supplier_api_key(supplier, email, password))
-        async with get_db_connection() as conn:
-            loop.run_until_complete(conn.execute(
-                "INSERT OR REPLACE INTO supplier_accounts (supplier, email, password, api_key, terms) VALUES ($1, $2, $3, $4, $5)",
-                supplier, email, password, api_key, terms
-            ))
+        result = loop.run_until_complete(insert_supplier_account(supplier, email, password, api_key, terms))
+        if not result:
+            raise Exception("Failed to insert supplier account")
         ACCOUNTS_CREATED.inc()
         secrets = {f"{supplier.upper()}_API_KEY": api_key, f"{supplier.upper()}_EMAIL": email, f"{supplier.upper()}_PASSWORD": password}
         secrets_manager.save_secrets(secrets)
@@ -629,6 +634,15 @@ def create_supplier_account(self, supplier: str, gmail_email: str, gmail_passwor
     finally:
         driver.quit()
     return email, password, api_key
+
+async def insert_supplier_account(supplier: str, email: str, password: str, api_key: str, terms: str) -> bool:
+    """Insert supplier account into database."""
+    async with get_db_connection() as conn:
+        await conn.execute(
+            "INSERT OR REPLACE INTO supplier_accounts (supplier, email, password, api_key, terms) VALUES ($1, $2, $3, $4, $5)",
+            supplier, email, password, api_key, terms
+        )
+        return True
 
 async def fetch_supplier_api_key(supplier: str, email: str, password: str) -> str:
     """Fetch API key for a supplier."""
@@ -708,11 +722,9 @@ def create_platform_account(self, platform: str, index: int, gmail_email: str, g
         loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
         token = loop.run_until_complete(fetch_platform_token(platform, email, password))
-        async with get_db_connection() as conn:
-            loop.run_until_complete(conn.execute(
-                "INSERT OR REPLACE INTO platform_accounts (platform, email, username, password, token, status) VALUES ($1, $2, $3, $4, $5, $6)",
-                platform, email, username, password, token, "active"
-            ))
+        result = loop.run_until_complete(insert_platform_account(platform, email, username, password, token))
+        if not result:
+            raise Exception("Failed to insert platform account")
         ACCOUNTS_CREATED.inc()
         secrets = {f"{platform.upper()}_TOKEN": token, f"{platform.upper()}_USERNAME": username, f"{platform.upper()}_PASSWORD": password}
         secrets_manager.save_secrets(secrets)
@@ -723,6 +735,15 @@ def create_platform_account(self, platform: str, index: int, gmail_email: str, g
     finally:
         driver.quit()
     return username, token
+
+async def insert_platform_account(platform: str, email: str, username: str, password: str, token: str) -> bool:
+    """Insert platform account into database."""
+    async with get_db_connection() as conn:
+        await conn.execute(
+            "INSERT OR REPLACE INTO platform_accounts (platform, email, username, password, token, status) VALUES ($1, $2, $3, $4, $5, $6)",
+            platform, email, username, password, token, "active"
+        )
+        return True
 
 async def fetch_platform_token(platform: str, email: str, password: str) -> str:
     """Fetch platform authentication token."""
@@ -781,11 +802,9 @@ def create_banking_account(self, provider: str, gmail_email: str, gmail_password
         loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
         api_key = loop.run_until_complete(fetch_banking_api_key(provider, email, password))
-        async with get_db_connection() as conn:
-            loop.run_until_complete(conn.execute(
-                "INSERT OR REPLACE INTO payment_accounts (email, type, password, api_key) VALUES ($1, $2, $3, $4)",
-                email, provider, password, api_key
-            ))
+        result = loop.run_until_complete(insert_banking_account(email, provider, password, api_key))
+        if not result:
+            raise Exception("Failed to insert banking account")
         ACCOUNTS_CREATED.inc()
         secrets = {f"{provider.upper()}_API_KEY": api_key, f"{provider.upper()}_EMAIL": email, f"{provider.upper()}_PASSWORD": password}
         secrets_manager.save_secrets(secrets)
@@ -796,6 +815,15 @@ def create_banking_account(self, provider: str, gmail_email: str, gmail_password
     finally:
         driver.quit()
     return email, password, api_key
+
+async def insert_banking_account(email: str, provider: str, password: str, api_key: str) -> bool:
+    """Insert banking account into database."""
+    async with get_db_connection() as conn:
+        await conn.execute(
+            "INSERT OR REPLACE INTO payment_accounts (email, type, password, api_key) VALUES ($1, $2, $3, $4)",
+            email, provider, password, api_key
+        )
+        return True
 
 async def fetch_banking_api_key(provider: str, email: str, password: str) -> str:
     """Fetch banking API key."""
@@ -864,20 +892,24 @@ async def list_product(platform: str, product: Dict, token: str) -> bool:
     """List a product on a platform."""
     try:
         LISTINGS_ACTIVE.inc()
-        async with get_db_connection() as conn:
-            await conn.execute(
-                "INSERT OR REPLACE INTO listings (sku, platform, title, price, cost, status, type) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                product["sku"], platform, product["title"], product["price"], product["cost"], "active", product["type"]
-            )
+        result = await insert_listing(product["sku"], platform, product["title"], product["price"], product["cost"], product["type"])
+        if not result:
+            raise Exception("Failed to insert listing")
         logger.info(f"Listed {product['title']} on {platform}")
         await bot.send_message(TELEGRAM_CHAT_ID, f"Listed {product['title']} on {platform}")
         return True
-    except asyncpg.PostgresError as e:
-        logger.error(f"Database error listing product on {platform}: {str(e)}")
-        return False
     except Exception as e:
         logger.error(f"Failed to list product on {platform}: {str(e)}")
         return False
+
+async def insert_listing(sku: str, platform: str, title: str, price: float, cost: float, type: str) -> bool:
+    """Insert listing into database."""
+    async with get_db_connection() as conn:
+        await conn.execute(
+            "INSERT OR REPLACE INTO listings (sku, platform, title, price, cost, status, type) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            sku, platform, title, price, cost, "active", type
+        )
+        return True
 
 # Order Fulfillment
 async def fulfill_order(order_id: str, platform: str, sku: str, buyer_name: str, buyer_address: str, source: str, api_key: str) -> bool:
@@ -885,25 +917,29 @@ async def fulfill_order(order_id: str, platform: str, sku: str, buyer_name: str,
     try:
         ORDERS_FULFILLED.inc()
         tracking_number = f"mock_tracking_{order_id}"
-        async with get_db_connection() as conn:
-            await conn.execute(
-                """
-                INSERT OR REPLACE INTO orders (
-                    order_id, platform, source_sku, buyer_name, buyer_address,
-                    status, source, tracking_number, fulfilled_at
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
-                """,
-                order_id, platform, sku, buyer_name, buyer_address, "fulfilled", source, tracking_number
-            )
+        result = await insert_order(order_id, platform, sku, buyer_name, buyer_address, source, tracking_number)
+        if not result:
+            raise Exception("Failed to insert order")
         await bot.send_message(TELEGRAM_CHAT_ID, f"Order {order_id} fulfilled with tracking: {tracking_number}")
         return True
-    except asyncpg.PostgresError as e:
-        logger.error(f"Database error fulfilling order {order_id}: {str(e)}")
-        return False
     except Exception as e:
         logger.error(f"Order fulfillment failed for {order_id}: {str(e)}")
         return False
+
+async def insert_order(order_id: str, platform: str, sku: str, buyer_name: str, buyer_address: str, source: str, tracking_number: str) -> bool:
+    """Insert order into database."""
+    async with get_db_connection() as conn:
+        await conn.execute(
+            """
+            INSERT OR REPLACE INTO orders (
+                order_id, platform, source_sku, buyer_name, buyer_address,
+                status, source, tracking_number, fulfilled_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
+            """,
+            order_id, platform, sku, buyer_name, buyer_address, "fulfilled", source, tracking_number
+        )
+        return True
 
 # Payment Processing
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
