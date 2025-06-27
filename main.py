@@ -115,6 +115,7 @@ config = Config()
 
 # SQLite Dashboard DB
 def init_dashboard_db():
+    """Initialize the SQLite dashboard database."""
     conn = sqlite3.connect("dashboard.db")
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS stats (
@@ -131,6 +132,7 @@ def init_dashboard_db():
 
 @app_flask.route("/")
 def dashboard():
+    """Render the dashboard with the latest stats."""
     conn = sqlite3.connect("dashboard.db")
     c = conn.cursor()
     c.execute("SELECT * FROM stats ORDER BY timestamp DESC LIMIT 1")
@@ -140,6 +142,7 @@ def dashboard():
 
 # Security
 class SecretsManager:
+    """Manage encrypted secrets storage."""
     def __init__(self, key_file: str = "secret.key"):
         if not os.path.exists(key_file):
             self.key = Fernet.generate_key()
@@ -151,6 +154,7 @@ class SecretsManager:
         self.cipher = Fernet(self.key)
 
     def save_secrets(self, secrets: Dict, secrets_file: str = "secrets.enc"):
+        """Encrypt and save secrets to file and environment."""
         encrypted = self.cipher.encrypt(json.dumps(secrets).encode())
         with open(secrets_file, "wb") as f:
             f.write(encrypted)
@@ -166,6 +170,7 @@ secrets_manager = SecretsManager()
 db_pool = None
 
 async def init_db():
+    """Initialize the PostgreSQL database pool and tables."""
     global db_pool
     db_pool = await asyncpg.create_pool(
         user=config.DB_USER,
@@ -227,7 +232,7 @@ async def init_db():
                 buyer_address TEXT,
                 status TEXT,
                 source TEXT,
-                tracking TEXT,
+                tracking_number TEXT,
                 fulfilled_at TIMESTAMP
             )
         ''')
@@ -244,6 +249,7 @@ async def init_db():
 
 # Models
 class Product(BaseModel):
+    """Model for product data."""
     title: str
     sku: str
     cost: float
@@ -257,14 +263,17 @@ class Product(BaseModel):
 ua = UserAgent()
 
 async def get_random_user_agent() -> str:
+    """Return a random user agent string."""
     return ua.random
 
 async def generate_email() -> str:
+    """Generate a random Gmail address."""
     domain = "gmail.com"
     user = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
     return f"{user}@{domain}"
 
 async def get_virtual_phone() -> str:
+    """Fetch a virtual phone number using Twilio."""
     REQUESTS_TOTAL.inc()
     auth = base64.b64encode(f"{config.TWILIO_SID}:{config.TWILIO_API_KEY}".encode()).decode()
     headers = {"Authorization": f"Basic {auth}"}
@@ -280,10 +289,16 @@ async def get_virtual_phone() -> str:
             return f"+1555{random.randint(1000000, 9999999)}"
 
 async def solve_captcha(site_key: str, url: str) -> Optional[str]:
+    """Solve a CAPTCHA using 2Captcha API."""
     REQUESTS_TOTAL.inc()
     async with aiohttp.ClientSession() as session:
-        captcha_url = await "http://api.2captcha.com/in.php"
-        async params = {"key": key[0], config.CAPTCHA_API_KEY, "method": "userrecaptcha", "googlekey": key[1], site_key, "pageurl": url}
+        captcha_url = "http://api.2captcha.com/in.php"
+        params = {
+            "key": config.CAPTCHA_API_KEY,
+            "method": "userrecaptcha",
+            "googlekey": site_key,
+            "pageurl": url
+        }
         async with session.post(captcha_url, data=params) as resp:
             text = await resp.text()
             if "OK" not in text:
@@ -291,17 +306,19 @@ async def solve_captcha(site_key: str, url: str) -> Optional[str]:
                 return None
             captcha_id = text.split("|")[1]
             for _ in range(10):
-                async with session.get(f"http://api.2captcha.com/res.php?key={config.CAPTCHA_API_KEY}&action=get&id={captcha_id}") as resp:
-                    text = await resp.text()
-                    if "OK" in text:
-                        return text.split("|")[1]
-                    if "CAPCHA_NOT_READY" not in text:
-                        logger.error(f"CAPTCHA failed: {text}")
-                        return None
                 await asyncio.sleep(5)
+                async with session.get(f"http://api.2captcha.com/res.php?key={config.CAPTCHA_API_KEY}&action=get&id={captcha_id}") as check_resp:
+                    check_text = await check_resp.text()
+                    if "OK" in check_text:
+                        return check_text.split("|")[1]
+                    if "CAPCHA_NOT_READY" not in check_text:
+                        logger.error(f"CAPTCHA failed: {check_text}")
+                        return None
+            logger.error("CAPTCHA timeout")
             return None
 
 async def fetch_otp(email: str, password: str, subject_filter: str = "verification") -> str:
+    """Fetch OTP from email."""
     REQUESTS_TOTAL.inc()
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -330,6 +347,7 @@ async def fetch_otp(email: str, password: str, subject_filter: str = "verificati
         return "mock_otp"
 
 def human_like_typing(element, text):
+    """Simulate human-like typing into a Selenium element."""
     for char in text:
         element.send_keys(char)
         time.sleep(random.uniform(0.05, 0.3))
@@ -340,6 +358,7 @@ def human_like_typing(element, text):
 
 # Proxy Manager
 class ProxyManager:
+    """Manage and rotate proxy servers."""
     def __init__(self):
         self.proxies = asyncio.run(self.fetch_proxy_list())
         self.failed_proxies = set()
@@ -376,6 +395,7 @@ proxy_manager = ProxyManager()
 
 # PayPal Authentication
 async def get_paypal_access_token() -> str:
+    """Fetch PayPal access token."""
     auth = f"{config.PAYPAL_CLIENT_ID}:{config.PAYPAL_SECRET}"
     headers = {
         "Authorization": f"Basic {base64.b64encode(auth.encode()).decode()}",
@@ -395,6 +415,7 @@ async def get_paypal_access_token() -> str:
 
 # Webhook Validation
 def verify_webhook_signature(payload: bytes, signature: str) -> bool:
+    """Verify webhook signature using HMAC-SHA1."""
     if not config.WEBHOOK_SECRET:
         return True
     computed = hmac.new(config.WEBHOOK_SECRET.encode(), payload, hashlib.sha1).hexdigest()
@@ -402,6 +423,7 @@ def verify_webhook_signature(payload: bytes, signature: str) -> bool:
 
 # Telegram Commands
 async def status(update, context):
+    """Send current system status via Telegram."""
     async with db_pool.acquire() as conn:
         accounts = await conn.fetchval("SELECT COUNT(*) FROM platform_accounts WHERE status = 'active'")
         listings = await conn.fetchval("SELECT COUNT(*) FROM listings WHERE status = 'active'")
@@ -411,11 +433,13 @@ async def status(update, context):
         await bot.send_message(chat_id=update.effective_chat.id, text=msg)
 
 async def pause(update, context):
+    """Pause system operations via Telegram."""
     global RUNNING
     RUNNING = False
     await bot.send_message(chat_id=update.effective_chat.id, text="Operations paused.")
 
 async def resume(update, context):
+    """Resume system operations via Telegram."""
     global RUNNING
     RUNNING = True
     await bot.send_message(chat_id=update.effective_chat.id, text="Operations resumed.")
@@ -428,6 +452,7 @@ dispatcher.add_handler(CommandHandler("resume", resume))
 @app_celery.task(bind=True)
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
 async def create_gmail_account(self) -> Tuple[str, str]:
+    """Create a new Gmail account."""
     email = await generate_email()
     password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
     phone = await get_virtual_phone()
@@ -475,6 +500,7 @@ async def create_gmail_account(self) -> Tuple[str, str]:
 @app_celery.task(bind=True)
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
 async def create_supplier_account(self, supplier: str, gmail_email: str, gmail_password: str) -> Tuple[str, str, Optional[str]]:
+    """Create a new supplier account."""
     email = gmail_email
     password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
     phone = await get_virtual_phone()
@@ -544,6 +570,7 @@ async def create_supplier_account(self, supplier: str, gmail_email: str, gmail_p
     return email, password, api_key
 
 async def fetch_supplier_api_key(supplier: str, email: str, password: str) -> str:
+    """Fetch API key for a supplier (mocked for non-CJ)."""
     if supplier == "CJ Dropshipping":
         return config.CJ_API_KEY
     return f"mock_key_{supplier.lower()}"
@@ -551,6 +578,7 @@ async def fetch_supplier_api_key(supplier: str, email: str, password: str) -> st
 @app_celery.task(bind=True)
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
 async def create_platform_account(self, platform: str, index: int, gmail_email: str, gmail_password: str) -> Tuple[str, str]:
+    """Create a new platform account."""
     email = gmail_email
     username = f"{platform.lower()}user{index}{random.randint(100, 999)}"
     password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
@@ -613,11 +641,13 @@ async def create_platform_account(self, platform: str, index: int, gmail_email: 
     return username, token
 
 async def fetch_platform_token(platform: str, email: str, password: str) -> str:
+    """Fetch platform token (mocked)."""
     return f"mock_token_{platform.lower()}"
 
 @app_celery.task(bind=True)
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
 async def create_banking_account(self, provider: str, gmail_email: str, gmail_password: str) -> Tuple[str, str, str]:
+    """Create a new banking account."""
     email = config.PAYPAL_EMAIL if provider == "Paypal" else gmail_email
     password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
     phone = await get_virtual_phone()
@@ -665,6 +695,7 @@ async def create_banking_account(self, provider: str, gmail_email: str, gmail_pa
     return email, password, api_key
 
 async def fetch_banking_api_key(provider: str, email: str, password: str) -> str:
+    """Fetch banking API key (mocked for non-Paypal)."""
     if provider == "Paypal":
         return config.PAYPAL_CLIENT_ID
     return f"mock_{provider.lower()}_key"
@@ -672,6 +703,7 @@ async def fetch_banking_api_key(provider: str, email: str, password: str) -> str
 # Product Sourcing
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
 async def fetch_trending_products(source: str, api_key: str, type: str) -> List[Dict]:
+    """Fetch trending products from a supplier."""
     REQUESTS_TOTAL.inc()
     if source == "CJ Dropshipping":
         timestamp = str(int(time.time() * 1000))
@@ -721,11 +753,12 @@ async def fetch_trending_products(source: str, api_key: str, type: str) -> List[
 # Product Listing
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
 async def list_product(platform: str, product: Dict, token: str) -> bool:
+    """List a product on a platform."""
     LISTINGS_ACTIVE.inc()
     async with db_pool.acquire() as conn:
         await conn.execute(
-            "INSERT OR REPLACE INTO listings (sku, platform, title, price, cost, source, status, type) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-            product["sku"], platform, product["title"], product["price"], product["cost"], product["source"], "active", product["type"]
+            "INSERT OR REPLACE INTO listings (sku, platform, title, price, cost, status, type) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            product["sku"], platform, product["title"], product["price"], product["cost"], "active", product["type"]
         )
     logger.info(f"Listed {product['title']} on {platform}")
     await bot.send_message(TELEGRAM_CHAT_ID, f"Listed {product['title']} on {platform}")
@@ -733,20 +766,27 @@ async def list_product(platform: str, product: Dict, token: str) -> bool:
 
 # Order Fulfillment
 async def fulfill_order(order_id: str, platform: str, sku: str, buyer_name: str, buyer_address: str, source: str, api_key: str) -> bool:
+    """Fulfill an order and update the database."""
     ORDERS_FULFILLED.inc()
     tracking_number = f"mock_tracking_{order_id}"
     async with db_pool.acquire() as conn:
         await conn.execute(
-            "INSERT OR REPLACE INTO orders (order_id, platform, source_sku, amount_name, buyer_name: buyer_address, status, source:, tracking_number, fulfilled_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)",
-            order_id, platform, sku, source_sku, buyer_name, buyer_address, "fulfilled", source, tracking_number
+            """
+            INSERT OR REPLACE INTO orders (
+                order_id, platform, source_sku, buyer_name, buyer_address,
+                status, source, tracking_number, fulfilled_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
+            """,
+            order_id, platform, sku, buyer_name, buyer_address, "fulfilled", source, tracking_number
         )
-    await bot.send_message(TELEGRAM_CHAT_ID, f"Order {order_id:} fulfilled order_id with tracking: {tracking_number}"}})
+    await bot.send_message(TELEGRAM_CHAT_ID, f"Order {order_id} fulfilled with tracking: {tracking_number}")
     return True
 
 # Payment Processing
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
 async def process_payment(amount: float, provider: str, api_key: str, destination: str = "final") -> bool:
+    """Process a payment using the specified provider."""
     PAYMENTS_PROCESSED.inc()
     if provider == "Paypal" and destination == "final":
         access_token = await get_paypal_access_token()
@@ -789,11 +829,13 @@ async def process_payment(amount: float, provider: str, api_key: str, destinatio
     return True
 
 async def pay_supplier(source: str, amount: float, api_key: str, terms: str):
+    """Record a payment to a supplier."""
     logger.info(f"Paid {source} ${amount:.2f} under {terms}")
     await bot.send_message(TELEGRAM_CHAT_ID, f"Paid {source} ${amount:.2f}")
 
 # Profit Tracking
 async def track_profit(revenue: float, cost: float):
+    """Track and store profit data."""
     profit = revenue - cost
     async with db_pool.acquire() as conn:
         await conn.execute("INSERT INTO profits (revenue, cost, profit) VALUES ($1, $2, $3)", revenue, cost, profit)
@@ -813,6 +855,7 @@ async def track_profit(revenue: float, cost: float):
 # Webhook Endpoint
 @app_flask.route("/start_workflow", methods=["POST"])
 async def start_workflow():
+    """Start the workflow via webhook."""
     if not RUNNING:
         return {"status": "Paused"}, 503
     payload = await request.get_data()
@@ -878,7 +921,6 @@ async def start_workflow():
             await fulfill_order(f"order_{i}", listing["platform"], listing["sku"], "Test Buyer", "123 Test St", listing["source"], supplier_api_key)
             await process_payment(listing["price"], "Paypal", banking_account[2] if banking_account else "mock_key")
             await track_profit(listing["price"], listing["cost"])
-            profit = listing["price"] - listing["cost"]
             await pay_supplier(listing["source"], listing["cost"], supplier_api_key, terms or "Net 30")
 
     return {"status": "Workflow completed"}, 200
