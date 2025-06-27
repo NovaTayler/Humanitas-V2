@@ -61,7 +61,7 @@ PAYMENTS_PROCESSED = Counter("payments_processed", "Total payments processed")
 LISTINGS_ACTIVE = Gauge("listings_active", "Active listings")
 ORDERS_FULFILLED = Counter("orders_fulfilled", "Orders fulfilled")
 
-# Celery setup (using sync tasks to avoid async issues)
+# Celery setup
 app_celery = Celery("dropshipping", broker="redis://redis:6379/0", backend="redis://redis:6379/1")
 app_celery.conf.task_reject_on_worker_lost = True
 app_celery.conf.task_acks_late = True
@@ -497,7 +497,7 @@ application.add_handler(CommandHandler("resume", resume))
 # Account Creation
 @app_celery.task(bind=True)
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
-def create_gmail_account(self) -> Tuple[str, str]:  # Changed to sync task
+def create_gmail_account(self) -> Tuple[str, str]:
     """Create a new Gmail account."""
     loop = asyncio.get_event_loop()
     email = loop.run_until_complete(generate_email())
@@ -537,7 +537,7 @@ def create_gmail_account(self) -> Tuple[str, str]:  # Changed to sync task
         driver.find_element(By.ID, "next").click()
         loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
-        loop.run_until_complete(asyncio.get_event_loop().run_in_executor(None, lambda: asyncio.run(init_db())))
+        loop.run_until_complete(init_db())
         async with get_db_connection() as conn:
             loop.run_until_complete(conn.execute("INSERT OR REPLACE INTO email_accounts (email, password) VALUES ($1, $2)", email, password))
         ACCOUNTS_CREATED.inc()
@@ -1079,5 +1079,5 @@ app.router.lifespan_context = lifespan
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
