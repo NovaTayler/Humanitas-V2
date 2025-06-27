@@ -70,8 +70,8 @@ app_celery.conf.task_acks_late = True
 app = FastAPI()
 
 # Telegram Bot
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7386307537:AAH_4rEoqE_WVyySz5aEoZ36a7iZ6Y3QWPg")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "5993436837")
 bot = Bot(TELEGRAM_BOT_TOKEN)
 application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 RUNNING = True
@@ -84,11 +84,11 @@ class Config:
     DB_NAME = os.getenv("DB_NAME", "dropshipping")
     DB_HOST = os.getenv("DB_HOST", "postgres")
     CAPTCHA_API_KEY = os.getenv("CAPTCHA_API_KEY", "79aecd3e952f7ccc567a0e8643250159")
-    TWILIO_SID = os.getenv("TWILIO_SID", "SK41e5e443ec313bbd3a50a31af3c9898b")
+    TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID", "SK41e5e443ec313bbd3a50a31af3c9898b")
     TWILIO_API_KEY = os.getenv("TWILIO_API_KEY", "2hfkF0qpDcP78Nj2qqPNYbD1mw6Yl4EZ")
     CJ_API_KEY = os.getenv("CJ_API_KEY", "c442a948bad74c118dd2a718a30be41e")
     CJ_SECRET_KEY = os.getenv("CJ_SECRET_KEY", "434e72487e8441a43ca6f05fed60f9a5b9aa002a2e740d2b6a43ac8983e1b9dd")
-    PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID", "AXS10dizgyGuUJ0U06sF7OI5h9TgRFf4gmyo9dy0AkzMaZvHEiDWK_jzEtqnIs9TOd_vOM-8mGh3aor-")
+    PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID", "AXS10dizgyGuUJ0U06sF7")
     PAYPAL_SECRET = os.getenv("PAYPAL_SECRET", "EImf7uyqqCqsE1-SaVq688NsyRIA6fmrjka5V15A03RrlxoX2Z4fAb5pq5X_TyZg62jVkR1g2OnFX-EL")
     PAYPAL_EMAIL = os.getenv("PAYPAL_EMAIL", "jefftayler@live.ca")
     BTC_WALLET = os.getenv("BTC_WALLET", "bc1q3mwnpa8ndqznyylgtgn8p329qh7g7vhzukdl5t")
@@ -110,10 +110,12 @@ class Config:
     REINVESTMENT_RATE = 0.3
     PROFIT_THRESHOLD = 2000
     BAN_THRESHOLD = 0.2
-    GCP_PROJECT = os.getenv("GCP_PROJECT")
+    GCP_PROJECT = os.getenv("GCP_PROJECT_ID", "affable-alpha-461019-g8")
     JOB_LOCATION = "us-central1"
     SERVICE_URL = os.getenv("SERVICE_URL")
-    WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+    WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecretwebhook123")
+    ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "info")
 
 config = Config()
 
@@ -459,13 +461,16 @@ async def get_paypal_access_token() -> str:
                 logger.error(f"PayPal token fetch failed: {await resp.text()}, status {resp.status}")
             return ""
 
-# Webhook Validation
+# Webhook Verification
 def verify_webhook_signature(payload: bytes, signature: str) -> bool:
-    """Verify webhook signature using HMAC-SHA1."""
-    if not config.WEBHOOK_SECRET:
-        return True
-    computed = hmac.new(config.WEBHOOK_SECRET.encode(), payload, hashlib.sha1).hexdigest()
-    return hmac.compare_digest(f"sha1={computed}", signature)
+    """Verify the webhook signature using SHA-256."""
+    secret = os.getenv("WEBHOOK_SECRET", "supersecretwebhook123")
+    computed_signature = hmac.new(
+        key=secret.encode(),
+        msg=payload,
+        digestmod=hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(computed_signature, signature)
 
 # Telegram Commands
 async def status(update, context):
@@ -1034,8 +1039,10 @@ async def start_workflow(request: Request):
     """Start the workflow via webhook."""
     if not RUNNING:
         return {"status": "Paused"}, 503
+
     payload = await request.body()
     signature = request.headers.get("X-Hub-Signature", "")
+
     if not verify_webhook_signature(payload, signature):
         return {"status": "Invalid signature"}, 403
 
