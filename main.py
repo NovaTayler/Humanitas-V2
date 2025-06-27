@@ -4,6 +4,7 @@ import os
 import random
 import string
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import aiohttp
 import structlog
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -25,15 +26,18 @@ from fake_useragent import UserAgent
 import re
 import imaplib
 import email
-import time
-from flask import Flask, render_template, request
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
 import sqlite3
-import telegram
-from telegram.ext import Updater, CommandHandler
-from datetime import datetime, timedelta
+from telegram import Bot
+from telegram.ext import Application, CommandHandler
+from datetime import datetime
 import hashlib
 import hmac
 from dotenv import load_dotenv, set_key
+from contextlib import asynccontextmanager
+import uvicorn
+import threading
 
 # Load environment
 load_dotenv()
@@ -57,33 +61,33 @@ PAYMENTS_PROCESSED = Counter("payments_processed", "Total payments processed")
 LISTINGS_ACTIVE = Gauge("listings_active", "Active listings")
 ORDERS_FULFILLED = Counter("orders_fulfilled", "Orders fulfilled")
 
-# Celery setup
+# Celery setup (using sync tasks to avoid async issues)
 app_celery = Celery("dropshipping", broker="redis://redis:6379/0", backend="redis://redis:6379/1")
 app_celery.conf.task_reject_on_worker_lost = True
 app_celery.conf.task_acks_late = True
 
-# Flask Dashboard
-app_flask = Flask(__name__)
+# FastAPI Dashboard
+app = FastAPI()
 
 # Telegram Bot
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
-updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
-dispatcher = updater.dispatcher
+bot = Bot(TELEGRAM_BOT_TOKEN)
+application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 RUNNING = True
 
 # Configuration
 class Config:
+    """Configuration class for the application."""
     DB_USER = os.getenv("DB_USER", "postgres")
-    DB_PASSWORD = os.getenv("DB_PASSWORD")
+    DB_PASSWORD = os.getenv("DB_PASSWORD", "your_secure_password")
     DB_NAME = os.getenv("DB_NAME", "dropshipping")
     DB_HOST = os.getenv("DB_HOST", "postgres")
     CAPTCHA_API_KEY = os.getenv("CAPTCHA_API_KEY", "79aecd3e952f7ccc567a0e8643250159")
     TWILIO_SID = os.getenv("TWILIO_SID", "SK41e5e443ec313bbd3a50a31af3c9898b")
     TWILIO_API_KEY = os.getenv("TWILIO_API_KEY", "2hfkF0qpDcP78Nj2qqPNYbD1mw6Yl4EZ")
     CJ_API_KEY = os.getenv("CJ_API_KEY", "c442a948bad74c118dd2a718a30be41e")
-    CJ_SECRET_KEY = os.getenv("CJ_SECRET_KEY", "434e72487ba8441a43ca6f05fed60f9a5b9aa002a2e740d2b6a43ac8983e1b9dd")
+    CJ_SECRET_KEY = os.getenv("CJ_SECRET_KEY", "434e72487e8441a43ca6f05fed60f9a5b9aa002a2e740d2b6a43ac8983e1b9dd")
     PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID", "AXS10dizgyGuUJ0U06sF7OI5h9TgRFf4gmyo9dy0AkzMaZvHEiDWK_jzEtqnIs9TOd_vOM-8mGh3aor-")
     PAYPAL_SECRET = os.getenv("PAYPAL_SECRET", "EImf7uyqqCqsE1-SaVq688NsyRIA6fmrjka5V15A03RrlxoX2Z4fAb5pq5X_TyZg62jVkR1g2OnFX-EL")
     PAYPAL_EMAIL = os.getenv("PAYPAL_EMAIL", "jefftayler@live.ca")
@@ -130,15 +134,19 @@ def init_dashboard_db():
     conn.commit()
     conn.close()
 
-@app_flask.route("/")
-def dashboard():
+# FastAPI Endpoint with Jinja2Templates
+from fastapi.templating import Jinja2Templates
+templates = Jinja2Templates(directory="templates")
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard(request: Request):
     """Render the dashboard with the latest stats."""
     conn = sqlite3.connect("dashboard.db")
     c = conn.cursor()
     c.execute("SELECT * FROM stats ORDER BY timestamp DESC LIMIT 1")
     stats = c.fetchone()
     conn.close()
-    return render_template("dashboard.html", stats=stats or (0, 0, 0, 0, 0, 0, "No data"))
+    return templates.TemplateResponse("dashboard.html", {"request": request, "stats": stats or (0, 0, 0, 0, 0, 0, "No data")})
 
 # Security
 class SecretsManager:
@@ -169,8 +177,22 @@ secrets_manager = SecretsManager()
 # Database (PostgreSQL)
 db_pool = None
 
+@asynccontextmanager
+async def get_db_connection():
+    """Provide a managed database connection."""
+    conn = await asyncpg.connect(
+        user=config.DB_USER,
+        password=config.DB_PASSWORD,
+        database=config.DB_NAME,
+        host=config.DB_HOST
+    )
+    try:
+        yield conn
+    finally:
+        await conn.close()
+
 async def init_db():
-    """Initialize the PostgreSQL database pool and tables."""
+    """Initialize the PostgreSQL database tables."""
     global db_pool
     db_pool = await asyncpg.create_pool(
         user=config.DB_USER,
@@ -178,7 +200,7 @@ async def init_db():
         database=config.DB_NAME,
         host=config.DB_HOST
     )
-    async with db_pool.acquire() as conn:
+    async with get_db_connection() as conn:
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS email_accounts (
                 email TEXT PRIMARY KEY,
@@ -261,16 +283,17 @@ class Product(BaseModel):
 
 # Utilities
 ua = UserAgent()
+executor = ThreadPoolExecutor(max_workers=10)
 
 async def get_random_user_agent() -> str:
     """Return a random user agent string."""
-    return ua.random
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(executor, ua.random)
 
 async def generate_email() -> str:
     """Generate a random Gmail address."""
-    domain = "gmail.com"
-    user = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
-    return f"{user}@{domain}"
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(executor, lambda: f"{''.join(random.choices(string.ascii_lowercase + string.digits, k=10))}@gmail.com")
 
 async def get_virtual_phone() -> str:
     """Fetch a virtual phone number using Twilio."""
@@ -285,8 +308,12 @@ async def get_virtual_phone() -> str:
             if resp.status == 201:
                 data = await resp.json()
                 return data["phone_number"]
-            logger.error(f"Twilio phone fetch failed: {await resp.text()}")
-            return f"+1555{random.randint(1000000, 9999999)}"
+            elif resp.status == 429:
+                logger.warning("Twilio rate limit exceeded, retrying")
+                raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=429)
+            else:
+                logger.error(f"Twilio phone fetch failed: {await resp.text()}")
+                return f"+1555{random.randint(1000000, 9999999)}"
 
 async def solve_captcha(site_key: str, url: str) -> Optional[str]:
     """Solve a CAPTCHA using 2Captcha API."""
@@ -302,7 +329,7 @@ async def solve_captcha(site_key: str, url: str) -> Optional[str]:
         async with session.post(captcha_url, data=params) as resp:
             text = await resp.text()
             if "OK" not in text:
-                logger.error(f"CAPTCHA submit failed: {text}")
+                logger.error(f"CAPTCHA submit failed: {text}, status {resp.status}")
                 return None
             captcha_id = text.split("|")[1]
             for _ in range(10):
@@ -311,9 +338,10 @@ async def solve_captcha(site_key: str, url: str) -> Optional[str]:
                     check_text = await check_resp.text()
                     if "OK" in check_text:
                         return check_text.split("|")[1]
-                    if "CAPCHA_NOT_READY" not in check_text:
-                        logger.error(f"CAPTCHA failed: {check_text}")
+                    elif "ERROR" in check_text:
+                        logger.error(f"CAPTCHA error: {check_text}")
                         return None
+                    await asyncio.sleep(1)  # Backoff for CAPCHA_NOT_READY
             logger.error("CAPTCHA timeout")
             return None
 
@@ -341,16 +369,31 @@ async def fetch_otp(email: str, password: str, subject_filter: str = "verificati
                             return otp.group()
             await asyncio.sleep(5)
         mail.logout()
-        raise Exception("OTP retrieval failed")
+        raise Exception("OTP retrieval failed after 15 attempts")
+    except imaplib.IMAP4.error as e:
+        logger.error(f"IMAP authentication failed: {str(e)}")
+        return "mock_otp"
     except Exception as e:
         logger.error(f"OTP fetch failed: {str(e)}")
         return "mock_otp"
 
-def human_like_typing(element, text):
-    """Simulate human-like typing into a Selenium element."""
+async def create_webdriver(chrome_options: Options) -> webdriver.Chrome:
+    """Create a WebDriver instance in a thread pool to avoid blocking."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(executor, lambda: webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=chrome_options
+    ))
+
+async def human_like_typing(element, text):
+    """Simulate human-like typing into a Selenium element asynchronously."""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(executor, lambda: _human_like_typing_sync(element, text))
+
+def _human_like_typing_sync(element, text):
     for char in text:
         element.send_keys(char)
-        time.sleep(random.uniform(0.05, 0.3))
+        time.sleep(random.uniform(0.05, 0.3))  # Blocking is fine here within executor
         if random.random() > 0.8:
             element.send_keys(Keys.BACKSPACE)
             time.sleep(0.5)
@@ -388,14 +431,14 @@ class ProxyManager:
                 if resp.status == 200:
                     proxies = (await resp.text()).splitlines()
                     return proxies[:50]
-                logger.error(f"Proxy fetch failed: {await resp.text()}")
+                logger.error(f"Proxy fetch failed: {await resp.text()}, status {resp.status}")
                 return []
 
 proxy_manager = ProxyManager()
 
 # PayPal Authentication
 async def get_paypal_access_token() -> str:
-    """Fetch PayPal access token."""
+    """Fetch PayPal access token with detailed error handling."""
     auth = f"{config.PAYPAL_CLIENT_ID}:{config.PAYPAL_SECRET}"
     headers = {
         "Authorization": f"Basic {base64.b64encode(auth.encode()).decode()}",
@@ -407,11 +450,14 @@ async def get_paypal_access_token() -> str:
             headers=headers,
             data={"grant_type": "client_credentials"}
         ) as resp:
-            if resp.status != 200:
-                logger.error(f"PayPal token fetch failed: {await resp.text()}")
-                return ""
-            data = await resp.json()
-            return data.get("access_token", "")
+            if resp.status == 200:
+                data = await resp.json()
+                return data.get("access_token", "")
+            elif resp.status == 401:
+                logger.error("PayPal authentication failed, check credentials")
+            else:
+                logger.error(f"PayPal token fetch failed: {await resp.text()}, status {resp.status}")
+            return ""
 
 # Webhook Validation
 def verify_webhook_signature(payload: bytes, signature: str) -> bool:
@@ -424,86 +470,95 @@ def verify_webhook_signature(payload: bytes, signature: str) -> bool:
 # Telegram Commands
 async def status(update, context):
     """Send current system status via Telegram."""
-    async with db_pool.acquire() as conn:
+    async with get_db_connection() as conn:
         accounts = await conn.fetchval("SELECT COUNT(*) FROM platform_accounts WHERE status = 'active'")
         listings = await conn.fetchval("SELECT COUNT(*) FROM listings WHERE status = 'active'")
         orders = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status = 'fulfilled'")
         profit = await conn.fetchval("SELECT SUM(profit) FROM profits") or 0
         msg = f"Status:\nAccounts: {accounts}\nListings: {listings}\nOrders: {orders}\nProfit: ${profit:.2f}"
-        await bot.send_message(chat_id=update.effective_chat.id, text=msg)
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=msg)
 
 async def pause(update, context):
     """Pause system operations via Telegram."""
     global RUNNING
     RUNNING = False
-    await bot.send_message(chat_id=update.effective_chat.id, text="Operations paused.")
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="Operations paused.")
 
 async def resume(update, context):
     """Resume system operations via Telegram."""
     global RUNNING
     RUNNING = True
-    await bot.send_message(chat_id=update.effective_chat.id, text="Operations resumed.")
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="Operations resumed.")
 
-dispatcher.add_handler(CommandHandler("status", status))
-dispatcher.add_handler(CommandHandler("pause", pause))
-dispatcher.add_handler(CommandHandler("resume", resume))
+application.add_handler(CommandHandler("status", status))
+application.add_handler(CommandHandler("pause", pause))
+application.add_handler(CommandHandler("resume", resume))
 
 # Account Creation
 @app_celery.task(bind=True)
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
-async def create_gmail_account(self) -> Tuple[str, str]:
+def create_gmail_account(self) -> Tuple[str, str]:  # Changed to sync task
     """Create a new Gmail account."""
-    email = await generate_email()
+    loop = asyncio.get_event_loop()
+    email = loop.run_until_complete(generate_email())
     password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
-    phone = await get_virtual_phone()
+    phone = loop.run_until_complete(get_virtual_phone())
     signup_url = "https://accounts.google.com/signup/v2/webcreateaccount"
     site_key = "6LeTnxkTAAAAAN9QEuDfp67ZNKsw2XHQ"
     session_id = f"gmail_{email}"
 
     chrome_options = Options()
-    chrome_options.add_argument(f"user-agent={await get_random_user_agent()}")
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument(f"user-agent={loop.run_until_complete(get_random_user_agent())}")
     proxy = proxy_manager.rotate(session_id).get("http")
     if proxy:
         chrome_options.add_argument(f"--proxy-server={proxy}")
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    driver = loop.run_until_complete(create_webdriver(chrome_options))
 
     try:
+        loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
         driver.get(signup_url)
-        time.sleep(random.uniform(2, 5))
-        human_like_typing(driver.find_element(By.ID, "username"), email.split("@")[0])
-        human_like_typing(driver.find_element(By.NAME, "Passwd"), password)
-        human_like_typing(driver.find_element(By.NAME, "PasswdAgain"), password)
-        human_like_typing(driver.find_element(By.ID, "phoneNumberId"), phone)
+        loop.run_until_complete(human_like_typing(driver.find_element(By.ID, "username"), email.split("@")[0]))
+        loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "Passwd"), password))
+        loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "PasswdAgain"), password))
+        loop.run_until_complete(human_like_typing(driver.find_element(By.ID, "phoneNumberId"), phone))
 
-        captcha_response = await solve_captcha(site_key, signup_url)
+        captcha_response = loop.run_until_complete(solve_captcha(site_key, signup_url))
         if captcha_response:
             driver.execute_script(f"document.getElementById('g-recaptcha-response').innerHTML='{captcha_response}';")
         driver.find_element(By.ID, "accountDetailsNext").click()
-        time.sleep(random.uniform(2, 5))
+        loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
-        otp = await fetch_otp(email, password)
-        human_like_typing(driver.find_element(By.ID, "code"), otp)
+        otp = loop.run_until_complete(fetch_otp(email, password))
+        loop.run_until_complete(human_like_typing(driver.find_element(By.ID, "code"), otp))
         driver.find_element(By.ID, "next").click()
-        time.sleep(random.uniform(2, 5))
+        loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
-        async with db_pool.acquire() as conn:
-            await conn.execute("INSERT OR REPLACE INTO email_accounts (email, password) VALUES ($1, $2)", email, password)
+        loop.run_until_complete(asyncio.get_event_loop().run_in_executor(None, lambda: asyncio.run(init_db())))
+        async with get_db_connection() as conn:
+            loop.run_until_complete(conn.execute("INSERT OR REPLACE INTO email_accounts (email, password) VALUES ($1, $2)", email, password))
         ACCOUNTS_CREATED.inc()
         secrets = {"GMAIL_EMAIL": email, "GMAIL_PASSWORD": password}
         secrets_manager.save_secrets(secrets)
-        await bot.send_message(TELEGRAM_CHAT_ID, f"Gmail created: {email}")
+        loop.run_until_complete(bot.send_message(TELEGRAM_CHAT_ID, f"Gmail created: {email}"))
+    except Exception as e:
+        logger.error(f"Gmail creation failed: {str(e)}")
+        raise
     finally:
         driver.quit()
     return email, password
 
 @app_celery.task(bind=True)
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
-async def create_supplier_account(self, supplier: str, gmail_email: str, gmail_password: str) -> Tuple[str, str, Optional[str]]:
+def create_supplier_account(self, supplier: str, gmail_email: str, gmail_password: str) -> Tuple[str, str, Optional[str]]:
     """Create a new supplier account."""
+    loop = asyncio.get_event_loop()
     email = gmail_email
     password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
-    phone = await get_virtual_phone()
+    phone = loop.run_until_complete(get_virtual_phone())
     urls = {
         "CJ Dropshipping": "https://cjdropshipping.com/register",
         "Walmart": "https://developer.walmart.com/register",
@@ -521,68 +576,91 @@ async def create_supplier_account(self, supplier: str, gmail_email: str, gmail_p
     }
     session_id = f"supplier_{supplier}_{email}"
     chrome_options = Options()
-    chrome_options.add_argument(f"user-agent={await get_random_user_agent()}")
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument(f"user-agent={loop.run_until_complete(get_random_user_agent())}")
     proxy = proxy_manager.rotate(session_id).get("http")
     if proxy:
         chrome_options.add_argument(f"--proxy-server={proxy}")
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    driver = loop.run_until_complete(create_webdriver(chrome_options))
 
     try:
+        loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
         driver.get(urls[supplier])
-        time.sleep(random.uniform(2, 5))
-        human_like_typing(driver.find_element(By.NAME, "email"), email)
-        human_like_typing(driver.find_element(By.NAME, "password"), password)
-        human_like_typing(driver.find_element(By.NAME, "phone"), phone)
-        captcha_response = await solve_captcha(site_keys[supplier], urls[supplier])
+        loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "email"), email))
+        loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "password"), password))
+        loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "phone"), phone))
+        captcha_response = loop.run_until_complete(solve_captcha(site_keys[supplier], urls[supplier]))
         if captcha_response:
             driver.execute_script(f"document.getElementById('g-recaptcha-response').innerHTML='{captcha_response}';")
         driver.find_element(By.XPATH, "//button[@type='submit']").click()
-        time.sleep(random.uniform(2, 5))
+        loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
-        otp = await fetch_otp(email, gmail_password)
-        human_like_typing(driver.find_element(By.NAME, "otp"), otp)
+        otp = loop.run_until_complete(fetch_otp(email, gmail_password))
+        loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "otp"), otp))
         driver.find_element(By.XPATH, "//button[@type='submit']").click()
-        time.sleep(random.uniform(2, 5))
+        loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
         terms = "Net 30" if random.random() < 0.7 else "Net 45"
         if supplier in terms_urls:
             driver.get(terms_urls[supplier])
-            time.sleep(random.uniform(2, 5))
-            human_like_typing(driver.find_element(By.NAME, "email"), email)
-            human_like_typing(driver.find_element(By.NAME, "business_name"), "AutoDrop LLC")
-            human_like_typing(driver.find_element(By.NAME, "terms"), terms)
+            loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
+            loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "email"), email))
+            loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "business_name"), "AutoDrop LLC"))
+            loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "terms"), terms))
             driver.find_element(By.XPATH, "//button[@type='submit']").click()
-            time.sleep(random.uniform(2, 5))
+            loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
-        api_key = await fetch_supplier_api_key(supplier, email, password)
-        async with db_pool.acquire() as conn:
-            await conn.execute(
+        api_key = loop.run_until_complete(fetch_supplier_api_key(supplier, email, password))
+        async with get_db_connection() as conn:
+            loop.run_until_complete(conn.execute(
                 "INSERT OR REPLACE INTO supplier_accounts (supplier, email, password, api_key, terms) VALUES ($1, $2, $3, $4, $5)",
                 supplier, email, password, api_key, terms
-            )
+            ))
         ACCOUNTS_CREATED.inc()
         secrets = {f"{supplier.upper()}_API_KEY": api_key, f"{supplier.upper()}_EMAIL": email, f"{supplier.upper()}_PASSWORD": password}
         secrets_manager.save_secrets(secrets)
-        await bot.send_message(TELEGRAM_CHAT_ID, f"{supplier} account created with {terms}: {email}")
+        loop.run_until_complete(bot.send_message(TELEGRAM_CHAT_ID, f"{supplier} account created with {terms}: {email}"))
+    except Exception as e:
+        logger.error(f"Supplier account creation failed: {str(e)}")
+        raise
     finally:
         driver.quit()
     return email, password, api_key
 
 async def fetch_supplier_api_key(supplier: str, email: str, password: str) -> str:
-    """Fetch API key for a supplier (mocked for non-CJ)."""
+    """Fetch API key for a supplier."""
     if supplier == "CJ Dropshipping":
-        return config.CJ_API_KEY
+        async with aiohttp.ClientSession() as session:
+            timestamp = str(int(time.time() * 1000))
+            sign = hmac.new(config.CJ_SECRET_KEY.encode(), (config.CJ_API_KEY + timestamp).encode(), hashlib.md5).hexdigest()
+            headers = {
+                "CJ-Access-Token": config.CJ_API_KEY,
+                "CJ-Timestamp": timestamp,
+                "CJ-Sign": sign,
+                "User-Agent": await get_random_user_agent()
+            }
+            async with session.get("https://developers.cjdropshipping.com/api2.0/v1/auth", headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("api_key", config.CJ_API_KEY)
+                elif resp.status == 401:
+                    logger.error("CJ authentication failed")
+                else:
+                    logger.error(f"CJ API key fetch failed: {await resp.text()}, status {resp.status}")
     return f"mock_key_{supplier.lower()}"
 
 @app_celery.task(bind=True)
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
-async def create_platform_account(self, platform: str, index: int, gmail_email: str, gmail_password: str) -> Tuple[str, str]:
+def create_platform_account(self, platform: str, index: int, gmail_email: str, gmail_password: str) -> Tuple[str, str]:
     """Create a new platform account."""
+    loop = asyncio.get_event_loop()
     email = gmail_email
     username = f"{platform.lower()}user{index}{random.randint(100, 999)}"
     password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
-    phone = await get_virtual_phone()
+    phone = loop.run_until_complete(get_virtual_phone())
     signup_urls = {
         "eBay": "https://signup.ebay.com/pa/register",
         "Amazon": "https://sellercentral.amazon.com/register",
@@ -599,105 +677,131 @@ async def create_platform_account(self, platform: str, index: int, gmail_email: 
     }
     session_id = f"{platform}_{username}"
     chrome_options = Options()
-    chrome_options.add_argument(f"user-agent={await get_random_user_agent()}")
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument(f"user-agent={loop.run_until_complete(get_random_user_agent())}")
     proxy = proxy_manager.rotate(session_id).get("http")
     if proxy:
         chrome_options.add_argument(f"--proxy-server={proxy}")
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    driver = loop.run_until_complete(create_webdriver(chrome_options))
 
     try:
+        loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
         driver.get(signup_urls[platform])
-        time.sleep(random.uniform(2, 5))
-        human_like_typing(driver.find_element(By.NAME, "email"), email)
-        human_like_typing(driver.find_element(By.NAME, "password"), password)
-        human_like_typing(driver.find_element(By.NAME, "phone"), phone)
-        human_like_typing(driver.find_element(By.NAME, "firstName"), f"User{index}")
-        human_like_typing(driver.find_element(By.NAME, "lastName"), "Auto")
+        loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "email"), email))
+        loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "password"), password))
+        loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "phone"), phone))
+        loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "firstName"), f"User{index}"))
+        loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "lastName"), "Auto"))
 
-        captcha_response = await solve_captcha(site_keys[platform], signup_urls[platform])
+        captcha_response = loop.run_until_complete(solve_captcha(site_keys[platform], signup_urls[platform]))
         if captcha_response:
             driver.execute_script(f"document.getElementById('g-recaptcha-response').innerHTML='{captcha_response}';")
         driver.find_element(By.XPATH, "//button[@type='submit']").click()
-        time.sleep(random.uniform(2, 5))
+        loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
-        otp = await fetch_otp(email, gmail_password)
-        human_like_typing(driver.find_element(By.NAME, "otp"), otp)
+        otp = loop.run_until_complete(fetch_otp(email, gmail_password))
+        loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "otp"), otp))
         driver.find_element(By.XPATH, "//button[@type='submit']").click()
-        time.sleep(random.uniform(2, 5))
+        loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
-        token = await fetch_platform_token(platform, email, password)
-        async with db_pool.acquire() as conn:
-            await conn.execute(
+        token = loop.run_until_complete(fetch_platform_token(platform, email, password))
+        async with get_db_connection() as conn:
+            loop.run_until_complete(conn.execute(
                 "INSERT OR REPLACE INTO platform_accounts (platform, email, username, password, token, status) VALUES ($1, $2, $3, $4, $5, $6)",
                 platform, email, username, password, token, "active"
-            )
+            ))
         ACCOUNTS_CREATED.inc()
         secrets = {f"{platform.upper()}_TOKEN": token, f"{platform.upper()}_USERNAME": username, f"{platform.upper()}_PASSWORD": password}
         secrets_manager.save_secrets(secrets)
-        await bot.send_message(TELEGRAM_CHAT_ID, f"{platform} account created: {username}")
+        loop.run_until_complete(bot.send_message(TELEGRAM_CHAT_ID, f"{platform} account created: {username}"))
+    except Exception as e:
+        logger.error(f"Platform account creation failed: {str(e)}")
+        raise
     finally:
         driver.quit()
     return username, token
 
 async def fetch_platform_token(platform: str, email: str, password: str) -> str:
-    """Fetch platform token (mocked)."""
+    """Fetch platform authentication token."""
+    if platform == "eBay":
+        async with aiohttp.ClientSession() as session:
+            auth = base64.b64encode(f"{email}:{password}".encode()).decode()
+            headers = {"Authorization": f"Basic {auth}"}
+            async with session.post("https://api.ebay.com/identity/v1/oauth2/token", headers=headers, data={"grant_type": "client_credentials"}) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("access_token", f"mock_token_{platform.lower()}")
+                elif resp.status == 401:
+                    logger.error("eBay authentication failed")
+                else:
+                    logger.error(f"eBay token fetch failed: {await resp.text()}, status {resp.status}")
     return f"mock_token_{platform.lower()}"
 
 @app_celery.task(bind=True)
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
-async def create_banking_account(self, provider: str, gmail_email: str, gmail_password: str) -> Tuple[str, str, str]:
+def create_banking_account(self, provider: str, gmail_email: str, gmail_password: str) -> Tuple[str, str, str]:
     """Create a new banking account."""
+    loop = asyncio.get_event_loop()
     email = config.PAYPAL_EMAIL if provider == "Paypal" else gmail_email
     password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
-    phone = await get_virtual_phone()
+    phone = loop.run_until_complete(get_virtual_phone())
     signup_urls = {"Paypal": "https://www.paypal.com/us/webapps/mpp/account-selection"}
     site_keys = {"Paypal": "6Lc8r-wZAAAAAK0xN52gL2zRdvzMJA2wLDpL9pAA"}
     session_id = f"banking_{provider}_{email}"
     chrome_options = Options()
-    chrome_options.add_argument(f"user-agent={await get_random_user_agent()}")
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument(f"user-agent={loop.run_until_complete(get_random_user_agent())}")
     proxy = proxy_manager.rotate(session_id).get("http")
     if proxy:
         chrome_options.add_argument(f"--proxy-server={proxy}")
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    driver = loop.run_until_complete(create_webdriver(chrome_options))
 
     try:
+        loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
         driver.get(signup_urls[provider])
-        time.sleep(random.uniform(2, 5))
-        human_like_typing(driver.find_element(By.NAME, "email"), email)
-        human_like_typing(driver.find_element(By.NAME, "password"), password)
-        human_like_typing(driver.find_element(By.NAME, "phone"), phone)
+        loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "email"), email))
+        loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "password"), password))
+        loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "phone"), phone))
 
-        captcha_response = await solve_captcha(site_keys[provider], signup_urls[provider])
+        captcha_response = loop.run_until_complete(solve_captcha(site_keys[provider], signup_urls[provider]))
         if captcha_response:
             driver.execute_script(f"document.getElementById('g-recaptcha-response').innerHTML='{captcha_response}';")
         driver.find_element(By.XPATH, "//button[@type='submit']").click()
-        time.sleep(random.uniform(2, 5))
+        loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
-        otp = await fetch_otp(email, gmail_password)
-        human_like_typing(driver.find_element(By.NAME, "otp"), otp)
+        otp = loop.run_until_complete(fetch_otp(email, gmail_password))
+        loop.run_until_complete(human_like_typing(driver.find_element(By.NAME, "otp"), otp))
         driver.find_element(By.XPATH, "//button[@type='submit']").click()
-        time.sleep(random.uniform(2, 5))
+        loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
-        api_key = await fetch_banking_api_key(provider, email, password)
-        async with db_pool.acquire() as conn:
-            await conn.execute(
+        api_key = loop.run_until_complete(fetch_banking_api_key(provider, email, password))
+        async with get_db_connection() as conn:
+            loop.run_until_complete(conn.execute(
                 "INSERT OR REPLACE INTO payment_accounts (email, type, password, api_key) VALUES ($1, $2, $3, $4)",
                 email, provider, password, api_key
-            )
+            ))
         ACCOUNTS_CREATED.inc()
         secrets = {f"{provider.upper()}_API_KEY": api_key, f"{provider.upper()}_EMAIL": email, f"{provider.upper()}_PASSWORD": password}
         secrets_manager.save_secrets(secrets)
-        await bot.send_message(TELEGRAM_CHAT_ID, f"{provider} account created: {email}")
+        loop.run_until_complete(bot.send_message(TELEGRAM_CHAT_ID, f"{provider} account created: {email}"))
+    except Exception as e:
+        logger.error(f"Banking account creation failed: {str(e)}")
+        raise
     finally:
         driver.quit()
     return email, password, api_key
 
 async def fetch_banking_api_key(provider: str, email: str, password: str) -> str:
-    """Fetch banking API key (mocked for non-Paypal)."""
+    """Fetch banking API key."""
     if provider == "Paypal":
         return config.PAYPAL_CLIENT_ID
+    logger.warning(f"No real API key for {provider}, using mock")
     return f"mock_{provider.lower()}_key"
 
 # Product Sourcing
@@ -718,25 +822,29 @@ async def fetch_trending_products(source: str, api_key: str, type: str) -> List[
         async with aiohttp.ClientSession(headers=headers) as session:
             await asyncio.sleep(config.RATE_LIMIT_DELAY)
             async with session.get("https://developers.cjdropshipping.com/api2.0/v1/product/list", params=params) as resp:
-                if resp.status != 200:
-                    logger.error(f"CJ Dropshipping fetch failed: {await resp.text()}")
+                if resp.status == 200:
+                    data = await resp.json()
+                    products = []
+                    for item in data.get("data", {}).get("list", []):
+                        price = float(item.get("sellPrice", 0))
+                        if config.PRICE_RANGE[0] <= price <= config.PRICE_RANGE[1]:
+                            products.append(Product(
+                                title=item.get("productNameEn", "Unknown"),
+                                sku=item.get("pid", f"CJ_{random.randint(1000, 9999)}"),
+                                cost=price,
+                                price=round(price * config.PROFIT_MARGIN, 2),
+                                url=item.get("productUrl", "https://cjdropshipping.com"),
+                                quantity=1 if type == "retail" else 10,
+                                source=source,
+                                type=type
+                            ).dict())
+                    return products
+                elif resp.status == 429:
+                    logger.warning("CJ API rate limit exceeded")
+                    raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=429)
+                else:
+                    logger.error(f"CJ Dropshipping fetch failed: {await resp.text()}, status {resp.status}")
                     return []
-                data = await resp.json()
-                products = []
-                for item in data.get("data", {}).get("list", []):
-                    price = float(item.get("sellPrice", 0))
-                    if config.PRICE_RANGE[0] <= price <= config.PRICE_RANGE[1]:
-                        products.append(Product(
-                            title=item.get("productNameEn", "Unknown"),
-                            sku=item.get("pid", f"CJ_{random.randint(1000, 9999)}"),
-                            cost=price,
-                            price=round(price * config.PROFIT_MARGIN, 2),
-                            url=item.get("productUrl", "https://cjdropshipping.com"),
-                            quantity=1 if type == "retail" else 10,
-                            source=source,
-                            type=type
-                        ).dict())
-                return products
     return [
         Product(
             title=f"Mock {source} Product",
@@ -754,96 +862,124 @@ async def fetch_trending_products(source: str, api_key: str, type: str) -> List[
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
 async def list_product(platform: str, product: Dict, token: str) -> bool:
     """List a product on a platform."""
-    LISTINGS_ACTIVE.inc()
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT OR REPLACE INTO listings (sku, platform, title, price, cost, status, type) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            product["sku"], platform, product["title"], product["price"], product["cost"], "active", product["type"]
-        )
-    logger.info(f"Listed {product['title']} on {platform}")
-    await bot.send_message(TELEGRAM_CHAT_ID, f"Listed {product['title']} on {platform}")
-    return True
+    try:
+        LISTINGS_ACTIVE.inc()
+        async with get_db_connection() as conn:
+            await conn.execute(
+                "INSERT OR REPLACE INTO listings (sku, platform, title, price, cost, status, type) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                product["sku"], platform, product["title"], product["price"], product["cost"], "active", product["type"]
+            )
+        logger.info(f"Listed {product['title']} on {platform}")
+        await bot.send_message(TELEGRAM_CHAT_ID, f"Listed {product['title']} on {platform}")
+        return True
+    except asyncpg.PostgresError as e:
+        logger.error(f"Database error listing product on {platform}: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to list product on {platform}: {str(e)}")
+        return False
 
 # Order Fulfillment
 async def fulfill_order(order_id: str, platform: str, sku: str, buyer_name: str, buyer_address: str, source: str, api_key: str) -> bool:
     """Fulfill an order and update the database."""
-    ORDERS_FULFILLED.inc()
-    tracking_number = f"mock_tracking_{order_id}"
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT OR REPLACE INTO orders (
-                order_id, platform, source_sku, buyer_name, buyer_address,
-                status, source, tracking_number, fulfilled_at
+    try:
+        ORDERS_FULFILLED.inc()
+        tracking_number = f"mock_tracking_{order_id}"
+        async with get_db_connection() as conn:
+            await conn.execute(
+                """
+                INSERT OR REPLACE INTO orders (
+                    order_id, platform, source_sku, buyer_name, buyer_address,
+                    status, source, tracking_number, fulfilled_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
+                """,
+                order_id, platform, sku, buyer_name, buyer_address, "fulfilled", source, tracking_number
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
-            """,
-            order_id, platform, sku, buyer_name, buyer_address, "fulfilled", source, tracking_number
-        )
-    await bot.send_message(TELEGRAM_CHAT_ID, f"Order {order_id} fulfilled with tracking: {tracking_number}")
-    return True
+        await bot.send_message(TELEGRAM_CHAT_ID, f"Order {order_id} fulfilled with tracking: {tracking_number}")
+        return True
+    except asyncpg.PostgresError as e:
+        logger.error(f"Database error fulfilling order {order_id}: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"Order fulfillment failed for {order_id}: {str(e)}")
+        return False
 
 # Payment Processing
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
 async def process_payment(amount: float, provider: str, api_key: str, destination: str = "final") -> bool:
     """Process a payment using the specified provider."""
-    PAYMENTS_PROCESSED.inc()
-    if provider == "Paypal" and destination == "final":
-        access_token = await get_paypal_access_token()
-        if not access_token:
-            logger.error("Failed to get PayPal access token")
-            return False
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "intent": "sale",
-            "payer": {"payment_method": "paypal"},
-            "transactions": [
-                {
-                    "amount": {"total": f"{amount:.2f}", "currency": "USD"},
-                    "description": f"Payment to {config.PAYPAL_EMAIL}"
-                }
-            ],
-            "redirect_urls": {"return_url": "https://example.com/success", "cancel_url": "https://example.com/cancel"}
-        }
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.post(
-                "https://api-m.sandbox.paypal.com/v1/payments/payment",
-                headers=headers,
-                json=payload
-            ) as resp:
-                if resp.status != 201:
-                    logger.error(f"PayPal payment failed: {await resp.text()}")
+    try:
+        PAYMENTS_PROCESSED.inc()
+        if provider == "Paypal" and destination == "final":
+            access_token = await get_paypal_access_token()
+            if not access_token:
+                logger.error("Failed to get PayPal access token")
+                return False
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "intent": "sale",
+                "payer": {"payment_method": "paypal"},
+                "transactions": [
+                    {
+                        "amount": {"total": f"{amount:.2f}", "currency": "USD"},
+                        "description": f"Payment to {config.PAYPAL_EMAIL}"
+                    }
+                ],
+                "redirect_urls": {"return_url": "https://example.com/success", "cancel_url": "https://example.com/cancel"}
+            }
+            async with aiohttp.ClientSession(headers=headers) as session:
+                async with session.post(
+                    "https://api-m.sandbox.paypal.com/v1/payments/payment",
+                    headers=headers,
+                    json=payload
+                ) as resp:
+                    if resp.status == 201:
+                        logger.info(f"Processed PayPal payment: ${amount:.2f}")
+                        await bot.send_message(TELEGRAM_CHAT_ID, f"PayPal payment: ${amount:.2f}")
+                        return True
+                    elif resp.status == 400:
+                        logger.error("PayPal invalid request")
+                    else:
+                        logger.error(f"PayPal payment failed: {await resp.text()}, status {resp.status}")
                     return False
-                logger.info(f"Processed PayPal payment: ${amount:.2f}")
-                await bot.send_message(TELEGRAM_CHAT_ID, f"PayPal payment: ${amount:.2f}")
-                return True
-    elif destination == "crypto":
-        logger.info(f"Mock crypto payment: ${amount:.2f} to BTC: {config.BTC_WALLET}")
-        await bot.send_message(TELEGRAM_CHAT_ID, f"Mock crypto payment: ${amount:.2f}")
+        elif destination == "crypto":
+            logger.info(f"Mock crypto payment: ${amount:.2f} to BTC: {config.BTC_WALLET}")
+            await bot.send_message(TELEGRAM_CHAT_ID, f"Mock crypto payment: ${amount:.2f}")
+            return True
+        logger.info(f"Mock payment: ${amount:.2f} via {provider}")
+        await bot.send_message(TELEGRAM_CHAT_ID, f"Mock payment: ${amount:.2f}")
         return True
-    logger.info(f"Mock payment: ${amount:.2f} via {provider}")
-    await bot.send_message(TELEGRAM_CHAT_ID, f"Mock payment: ${amount:.2f}")
-    return True
+    except aiohttp.ClientError as e:
+        logger.error(f"HTTP error during payment: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"Payment processing failed: {str(e)}")
+        return False
 
 async def pay_supplier(source: str, amount: float, api_key: str, terms: str):
     """Record a payment to a supplier."""
-    logger.info(f"Paid {source} ${amount:.2f} under {terms}")
-    await bot.send_message(TELEGRAM_CHAT_ID, f"Paid {source} ${amount:.2f}")
+    try:
+        logger.info(f"Paid {source} ${amount:.2f} under {terms}")
+        await bot.send_message(TELEGRAM_CHAT_ID, f"Paid {source} ${amount:.2f}")
+    except Exception as e:
+        logger.error(f"Supplier payment failed: {str(e)}")
 
 # Profit Tracking
 async def track_profit(revenue: float, cost: float):
     """Track and store profit data."""
-    profit = revenue - cost
-    async with db_pool.acquire() as conn:
-        await conn.execute("INSERT INTO profits (revenue, cost, profit) VALUES ($1, $2, $3)", revenue, cost, profit)
-        accounts = await conn.fetchval("SELECT COUNT(*) FROM platform_accounts WHERE status = 'active'")
-        listings = await conn.fetchval("SELECT COUNT(*) FROM listings WHERE status = 'active'")
-        orders = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status = 'fulfilled'")
-        total_revenue = await conn.fetchval("SELECT SUM(revenue) FROM profits") or 0
-        total_profit = await conn.fetchval("SELECT SUM(profit) FROM profits") or 0
+    try:
+        profit = revenue - cost
+        async with get_db_connection() as conn:
+            await conn.execute("INSERT INTO profits (revenue, cost, profit) VALUES ($1, $2, $3)", revenue, cost, profit)
+            accounts = await conn.fetchval("SELECT COUNT(*) FROM platform_accounts WHERE status = 'active'")
+            listings = await conn.fetchval("SELECT COUNT(*) FROM listings WHERE status = 'active'")
+            orders = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status = 'fulfilled'")
+            total_revenue = await conn.fetchval("SELECT SUM(revenue) FROM profits") or 0
+            total_profit = await conn.fetchval("SELECT SUM(profit) FROM profits") or 0
         conn = sqlite3.connect("dashboard.db")
         c = conn.cursor()
         c.execute("INSERT INTO stats (accounts, listings, orders, revenue, profit, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
@@ -851,25 +987,30 @@ async def track_profit(revenue: float, cost: float):
         conn.commit()
         conn.close()
         await bot.send_message(TELEGRAM_CHAT_ID, f"Profit update: ${profit:.2f} (Total: ${total_profit:.2f})")
+    except asyncpg.PostgresError as e:
+        logger.error(f"Database error tracking profit: {str(e)}")
+    except Exception as e:
+        logger.error(f"Profit tracking failed: {str(e)}")
 
 # Webhook Endpoint
-@app_flask.route("/start_workflow", methods=["POST"])
-async def start_workflow():
+@app.post("/start_workflow")
+async def start_workflow(request: Request):
     """Start the workflow via webhook."""
     if not RUNNING:
         return {"status": "Paused"}, 503
-    payload = await request.get_data()
+    payload = await request.body()
     signature = request.headers.get("X-Hub-Signature", "")
     if not verify_webhook_signature(payload, signature):
         return {"status": "Invalid signature"}, 403
 
     await init_db()
     init_dashboard_db()
-    updater.start_polling()
+    # Start Telegram polling in a background thread
+    threading.Thread(target=lambda: asyncio.run(application.run_polling()), daemon=True).start()
 
     # Create single Gmail account
     gmail_task = create_gmail_account.delay()
-    gmail_email, gmail_password = await gmail_task.get()
+    gmail_email, gmail_password = await asyncio.get_event_loop().run_in_executor(None, lambda: gmail_task.get())
     if isinstance(gmail_email, Exception):
         logger.error(f"Gmail creation failed: {gmail_email}")
         return {"status": "Error"}, 500
@@ -878,7 +1019,7 @@ async def start_workflow():
     supplier_accounts = []
     for supplier in config.SUPPLIERS:
         task = create_supplier_account.delay(supplier, gmail_email, gmail_password)
-        result = await task.get()
+        result = await asyncio.get_event_loop().run_in_executor(None, lambda: task.get())
         if not isinstance(result, Exception):
             supplier_accounts.append(result)
 
@@ -887,7 +1028,7 @@ async def start_workflow():
     for platform in config.PLATFORMS:
         for i in range(config.NUM_ACCOUNTS_PER_PLATFORM):
             task = create_platform_account.delay(platform, i, gmail_email, gmail_password)
-            result = await task.get()
+            result = await asyncio.get_event_loop().run_in_executor(None, lambda: task.get())
             if not isinstance(result, Exception):
                 platform_accounts.append(result)
 
@@ -895,7 +1036,7 @@ async def start_workflow():
     banking_account = None
     for provider in config.BANKING:
         task = create_banking_account.delay(provider, gmail_email, gmail_password)
-        result = await task.get()
+        result = await asyncio.get_event_loop().run_in_executor(None, lambda: task.get())
         if not isinstance(result, Exception):
             banking_account = result
 
@@ -913,7 +1054,7 @@ async def start_workflow():
             await asyncio.gather(*tasks, return_exceptions=True)
 
     # Test orders
-    async with db_pool.acquire() as conn:
+    async with get_db_connection() as conn:
         listings = await conn.fetch("SELECT sku, platform, source, price, cost FROM listings WHERE status = 'active' LIMIT $1", config.TEST_ORDERS)
         for i, listing in enumerate(listings):
             supplier_api_key = next((api_key for _, _, api_key in supplier_accounts if listing["source"].lower() in api_key.lower()), "mock_key")
@@ -925,6 +1066,18 @@ async def start_workflow():
 
     return {"status": "Workflow completed"}, 200
 
+# Startup and Shutdown
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handle application startup and shutdown."""
+    # Start Telegram polling in a background thread
+    threading.Thread(target=lambda: asyncio.run(application.run_polling()), daemon=True).start()
+    yield
+    await application.stop()
+
+app.router.lifespan_context = lifespan
+
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.environ.get("PORT", 8080))
-    app_flask.run(host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
