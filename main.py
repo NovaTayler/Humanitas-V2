@@ -27,7 +27,7 @@ import re
 import imaplib
 import email
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 import sqlite3
 from telegram import Bot
 from telegram.ext import Application, CommandHandler
@@ -36,6 +36,8 @@ import hashlib
 import hmac
 from dotenv import load_dotenv, set_key
 from contextlib import asynccontextmanager
+import threading
+import time
 
 # Load environment
 load_dotenv()
@@ -180,80 +182,81 @@ db_pool = None
 async def init_db():
     """Initialize the PostgreSQL database tables."""
     global db_pool
-    db_pool = await asyncpg.create_pool(
-        user=config.DB_USER,
-        password=config.DB_PASSWORD,
-        database=config.DB_NAME,
-        host=config.DB_HOST
-    )
-    async with db_pool.acquire() as conn:  # Using db_pool.acquire for consistency
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS email_accounts (
-                email TEXT PRIMARY KEY,
-                password TEXT
-            )
-        ''')
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS supplier_accounts (
-                supplier TEXT,
-                email TEXT PRIMARY KEY,
-                password TEXT,
-                api_key TEXT,
-                terms TEXT
-            )
-        ''')
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS platform_accounts (
-                platform TEXT,
-                email TEXT,
-                username TEXT PRIMARY KEY,
-                password TEXT,
-                token TEXT,
-                status TEXT
-            )
-        ''')
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS payment_accounts (
-                email TEXT PRIMARY KEY,
-                type TEXT,
-                password TEXT,
-                api_key TEXT
-            )
-        ''')
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS listings (
-                sku TEXT PRIMARY KEY,
-                platform TEXT,
-                title TEXT,
-                price FLOAT,
-                cost FLOAT,
-                status TEXT,
-                type TEXT
-            )
-        ''')
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS orders (
-                order_id TEXT PRIMARY KEY,
-                platform TEXT,
-                source_sku TEXT,
-                buyer_name TEXT,
-                buyer_address TEXT,
-                status TEXT,
-                source TEXT,
-                tracking_number TEXT,
-                fulfilled_at TIMESTAMP
-            )
-        ''')
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS profits (
-                id SERIAL PRIMARY KEY,
-                revenue REAL,
-                cost REAL,
-                profit REAL,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-    logger.info("Database initialized")
+    if db_pool is None:
+        db_pool = await asyncpg.create_pool(
+            user=config.DB_USER,
+            password=config.DB_PASSWORD,
+            database=config.DB_NAME,
+            host=config.DB_HOST
+        )
+        async with db_pool.acquire() as conn:
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS email_accounts (
+                    email TEXT PRIMARY KEY,
+                    password TEXT
+                )
+            ''')
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS supplier_accounts (
+                    supplier TEXT,
+                    email TEXT PRIMARY KEY,
+                    password TEXT,
+                    api_key TEXT,
+                    terms TEXT
+                )
+            ''')
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS platform_accounts (
+                    platform TEXT,
+                    email TEXT,
+                    username TEXT PRIMARY KEY,
+                    password TEXT,
+                    token TEXT,
+                    status TEXT
+                )
+            ''')
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS payment_accounts (
+                    email TEXT PRIMARY KEY,
+                    type TEXT,
+                    password TEXT,
+                    api_key TEXT
+                )
+            ''')
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS listings (
+                    sku TEXT PRIMARY KEY,
+                    platform TEXT,
+                    title TEXT,
+                    price FLOAT,
+                    cost FLOAT,
+                    status TEXT,
+                    type TEXT
+                )
+            ''')
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS orders (
+                    order_id TEXT PRIMARY KEY,
+                    platform TEXT,
+                    source_sku TEXT,
+                    buyer_name TEXT,
+                    buyer_address TEXT,
+                    status TEXT,
+                    source TEXT,
+                    tracking_number TEXT,
+                    fulfilled_at TIMESTAMP
+                )
+            ''')
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS profits (
+                    id SERIAL PRIMARY KEY,
+                    revenue REAL,
+                    cost REAL,
+                    profit REAL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+        logger.info("Database initialized")
 
 # Models
 class Product(BaseModel):
@@ -428,6 +431,7 @@ proxy_manager = ProxyManager()
 @app.on_event("startup")
 async def startup_event():
     await proxy_manager.init()
+    await init_db()  # Ensure init_db is called asynchronously
 
 # PayPal Authentication
 async def get_paypal_access_token() -> str:
@@ -466,7 +470,7 @@ def verify_webhook_signature(payload: bytes, signature: str) -> bool:
 # Telegram Commands
 async def status(update, context):
     """Send current system status via Telegram."""
-    async with db_pool.acquire() as conn:  # Standardized to db_pool
+    async with db_pool.acquire() as conn:
         accounts = await conn.fetchval("SELECT COUNT(*) FROM platform_accounts WHERE status = 'active'")
         listings = await conn.fetchval("SELECT COUNT(*) FROM listings WHERE status = 'active'")
         orders = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status = 'fulfilled'")
@@ -495,7 +499,6 @@ application.add_handler(CommandHandler("resume", resume))
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
 def create_gmail_account(self) -> Tuple[str, str]:
     """Create a new Gmail account."""
-    # Warning: run_until_complete() may block the event loop at high volume
     loop = asyncio.get_event_loop()
     email = loop.run_until_complete(generate_email())
     password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
@@ -527,7 +530,7 @@ def create_gmail_account(self) -> Tuple[str, str]:
         if captcha_response:
             driver.execute_script(f"document.getElementById('g-recaptcha-response').innerHTML='{captcha_response}';")
         else:
-            logger.warning("CAPTCHA failed, proceeding without verification")  # Fallback behavior
+            logger.warning("CAPTCHA failed, proceeding without verification")
         driver.find_element(By.ID, "accountDetailsNext").click()
         loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
@@ -536,9 +539,10 @@ def create_gmail_account(self) -> Tuple[str, str]:
         driver.find_element(By.ID, "next").click()
         loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
-        loop.run_until_complete(init_db())
-        async with db_pool.acquire() as conn:  # Standardized to db_pool
-            result = await conn.execute("INSERT OR REPLACE INTO email_accounts (email, password) VALUES ($1, $2)", email, password)
+        async def insert_email():
+            async with db_pool.acquire() as conn:
+                return await conn.execute("INSERT OR REPLACE INTO email_accounts (email, password) VALUES ($1, $2)", email, password)
+        result = loop.run_until_complete(insert_email())
         if not result:
             raise Exception("Failed to insert email account")
         ACCOUNTS_CREATED.inc()
@@ -556,7 +560,6 @@ def create_gmail_account(self) -> Tuple[str, str]:
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
 def create_supplier_account(self, supplier: str, gmail_email: str, gmail_password: str) -> Tuple[str, str, Optional[str]]:
     """Create a new supplier account."""
-    # Warning: run_until_complete() may block the event loop at high volume
     loop = asyncio.get_event_loop()
     email = gmail_email
     password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
@@ -598,7 +601,7 @@ def create_supplier_account(self, supplier: str, gmail_email: str, gmail_passwor
         if captcha_response:
             driver.execute_script(f"document.getElementById('g-recaptcha-response').innerHTML='{captcha_response}';")
         else:
-            logger.warning("CAPTCHA failed, proceeding without verification")  # Fallback behavior
+            logger.warning("CAPTCHA failed, proceeding without verification")
         driver.find_element(By.XPATH, "//button[@type='submit']").click()
         loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
@@ -618,11 +621,13 @@ def create_supplier_account(self, supplier: str, gmail_email: str, gmail_passwor
             loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
         api_key = loop.run_until_complete(fetch_supplier_api_key(supplier, email, password))
-        async with db_pool.acquire() as conn:  # Standardized to db_pool
-            result = await conn.execute(
-                "INSERT OR REPLACE INTO supplier_accounts (supplier, email, password, api_key, terms) VALUES ($1, $2, $3, $4, $5)",
-                supplier, email, password, api_key, terms
-            )
+        async def insert_supplier():
+            async with db_pool.acquire() as conn:
+                return await conn.execute(
+                    "INSERT OR REPLACE INTO supplier_accounts (supplier, email, password, api_key, terms) VALUES ($1, $2, $3, $4, $5)",
+                    supplier, email, password, api_key, terms
+                )
+        result = loop.run_until_complete(insert_supplier())
         if not result:
             raise Exception("Failed to insert supplier account")
         ACCOUNTS_CREATED.inc()
@@ -662,7 +667,6 @@ async def fetch_supplier_api_key(supplier: str, email: str, password: str) -> st
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
 def create_platform_account(self, platform: str, index: int, gmail_email: str, gmail_password: str) -> Tuple[str, str]:
     """Create a new platform account."""
-    # Warning: run_until_complete() may block the event loop at high volume
     loop = asyncio.get_event_loop()
     email = gmail_email
     username = f"{platform.lower()}user{index}{random.randint(100, 999)}"
@@ -707,7 +711,7 @@ def create_platform_account(self, platform: str, index: int, gmail_email: str, g
         if captcha_response:
             driver.execute_script(f"document.getElementById('g-recaptcha-response').innerHTML='{captcha_response}';")
         else:
-            logger.warning("CAPTCHA failed, proceeding without verification")  # Fallback behavior
+            logger.warning("CAPTCHA failed, proceeding without verification")
         driver.find_element(By.XPATH, "//button[@type='submit']").click()
         loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
@@ -717,11 +721,13 @@ def create_platform_account(self, platform: str, index: int, gmail_email: str, g
         loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
         token = loop.run_until_complete(fetch_platform_token(platform, email, password))
-        async with db_pool.acquire() as conn:  # Standardized to db_pool
-            result = await conn.execute(
-                "INSERT OR REPLACE INTO platform_accounts (platform, email, username, password, token, status) VALUES ($1, $2, $3, $4, $5, $6)",
-                platform, email, username, password, token, "active"
-            )
+        async def insert_platform():
+            async with db_pool.acquire() as conn:
+                return await conn.execute(
+                    "INSERT OR REPLACE INTO platform_accounts (platform, email, username, password, token, status) VALUES ($1, $2, $3, $4, $5, $6)",
+                    platform, email, username, password, token, "active"
+                )
+        result = loop.run_until_complete(insert_platform())
         if not result:
             raise Exception("Failed to insert platform account")
         ACCOUNTS_CREATED.inc()
@@ -755,7 +761,6 @@ async def fetch_platform_token(platform: str, email: str, password: str) -> str:
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
 def create_banking_account(self, provider: str, gmail_email: str, gmail_password: str) -> Tuple[str, str, str]:
     """Create a new banking account."""
-    # Warning: run_until_complete() may block the event loop at high volume
     loop = asyncio.get_event_loop()
     email = config.PAYPAL_EMAIL if provider == "Paypal" else gmail_email
     password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
@@ -785,7 +790,7 @@ def create_banking_account(self, provider: str, gmail_email: str, gmail_password
         if captcha_response:
             driver.execute_script(f"document.getElementById('g-recaptcha-response').innerHTML='{captcha_response}';")
         else:
-            logger.warning("CAPTCHA failed, proceeding without verification")  # Fallback behavior
+            logger.warning("CAPTCHA failed, proceeding without verification")
         driver.find_element(By.XPATH, "//button[@type='submit']").click()
         loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
@@ -795,11 +800,13 @@ def create_banking_account(self, provider: str, gmail_email: str, gmail_password
         loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
         api_key = loop.run_until_complete(fetch_banking_api_key(provider, email, password))
-        async with db_pool.acquire() as conn:  # Standardized to db_pool
-            result = await conn.execute(
-                "INSERT OR REPLACE INTO payment_accounts (email, type, password, api_key) VALUES ($1, $2, $3, $4)",
-                email, provider, password, api_key
-            )
+        async def insert_banking():
+            async with db_pool.acquire() as conn:
+                return await conn.execute(
+                    "INSERT OR REPLACE INTO payment_accounts (email, type, password, api_key) VALUES ($1, $2, $3, $4)",
+                    email, provider, password, api_key
+                )
+        result = loop.run_until_complete(insert_banking())
         if not result:
             raise Exception("Failed to insert banking account")
         ACCOUNTS_CREATED.inc()
@@ -880,7 +887,7 @@ async def list_product(platform: str, product: Dict, token: str) -> bool:
     """List a product on a platform."""
     try:
         LISTINGS_ACTIVE.inc()
-        async with db_pool.acquire() as conn:  # Standardized to db_pool
+        async with db_pool.acquire() as conn:
             result = await conn.execute(
                 "INSERT OR REPLACE INTO listings (sku, platform, title, price, cost, status, type) VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 product["sku"], platform, product["title"], product["price"], product["cost"], "active", product["type"]
@@ -900,7 +907,7 @@ async def fulfill_order(order_id: str, platform: str, sku: str, buyer_name: str,
     try:
         ORDERS_FULFILLED.inc()
         tracking_number = f"mock_tracking_{order_id}"
-        async with db_pool.acquire() as conn:  # Standardized to db_pool
+        async with db_pool.acquire() as conn:
             result = await conn.execute(
                 """
                 INSERT OR REPLACE INTO orders (
@@ -987,7 +994,7 @@ async def track_profit(revenue: float, cost: float):
     """Track and store profit data."""
     try:
         profit = revenue - cost
-        async with db_pool.acquire() as conn:  # Standardized to db_pool
+        async with db_pool.acquire() as conn:
             await conn.execute("INSERT INTO profits (revenue, cost, profit) VALUES ($1, $2, $3)", revenue, cost, profit)
             accounts = await conn.fetchval("SELECT COUNT(*) FROM platform_accounts WHERE status = 'active'")
             listings = await conn.fetchval("SELECT COUNT(*) FROM listings WHERE status = 'active'")
@@ -1011,15 +1018,14 @@ async def track_profit(revenue: float, cost: float):
 async def start_workflow(request: Request):
     """Start the workflow via webhook."""
     if not RUNNING:
-        return {"status": "Paused"}, 503
+        return JSONResponse(content={"status": "Paused"}, status_code=503)
 
     payload = await request.body()
     signature = request.headers.get("X-Hub-Signature", "")
 
     if not verify_webhook_signature(payload, signature):
-        return {"status": "Invalid signature"}, 403
+        return JSONResponse(content={"status": "Invalid signature"}, status_code=403)
 
-    await init_db()
     init_dashboard_db()
     # Start Telegram polling in a background thread
     threading.Thread(target=lambda: asyncio.run(application.run_polling()), daemon=True).start()
@@ -1029,7 +1035,7 @@ async def start_workflow(request: Request):
     gmail_email, gmail_password = await asyncio.get_event_loop().run_in_executor(None, lambda: gmail_task.get())
     if isinstance(gmail_email, Exception):
         logger.error(f"Gmail creation failed: {gmail_email}")
-        return {"status": "Error"}, 500
+        return JSONResponse(content={"status": "Error"}, status_code=500)
 
     # Supplier accounts
     supplier_accounts = []
@@ -1070,7 +1076,7 @@ async def start_workflow(request: Request):
             await asyncio.gather(*tasks, return_exceptions=True)
 
     # Test orders
-    async with db_pool.acquire() as conn:  # Standardized to db_pool
+    async with db_pool.acquire() as conn:
         listings = await conn.fetch("SELECT sku, platform, source, price, cost FROM listings WHERE status = 'active' LIMIT $1", config.TEST_ORDERS)
         for i, listing in enumerate(listings):
             supplier_api_key = next((api_key for _, _, api_key in supplier_accounts if listing["source"].lower() in api_key.lower()), "mock_key")
@@ -1080,7 +1086,7 @@ async def start_workflow(request: Request):
             await track_profit(listing["price"], listing["cost"])
             await pay_supplier(listing["source"], listing["cost"], supplier_api_key, terms or "Net 30")
 
-    return {"status": "Workflow completed"}, 200
+    return JSONResponse(content={"status": "Workflow completed"}, status_code=200)
 
 # Startup and Shutdown
 @asynccontextmanager
@@ -1095,5 +1101,5 @@ app.router.lifespan_context = lifespan
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
