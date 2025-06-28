@@ -299,7 +299,7 @@ async def get_virtual_phone() -> str:
                 return data["phone_number"]
             elif resp.status == 429:
                 logger.warning("Twilio rate limit exceeded, retrying")
-                raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=429)
+                raise aiohttpClientResponseError(resp.request_info, resp.history, status=429)
             else:
                 logger.error(f"Twilio phone fetch failed: {await resp.text()}")
                 return f"+1555{random.randint(1000000, 9999999)}"
@@ -1013,6 +1013,12 @@ async def track_profit(revenue: float, cost: float):
     except Exception as e:
         logger.error(f"Profit tracking failed: {str(e)}")
 
+def run_telegram_bot():
+    """Run Telegram bot polling with a dedicated event loop."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(application.run_polling())
+
 # Webhook Endpoint
 @app.post("/start_workflow")
 async def start_workflow(request: Request):
@@ -1028,7 +1034,7 @@ async def start_workflow(request: Request):
 
     init_dashboard_db()
     # Start Telegram polling in a background thread
-    threading.Thread(target=lambda: asyncio.run(application.run_polling()), daemon=True).start()
+    threading.Thread(target=run_telegram_bot, daemon=True).start()
 
     # Create single Gmail account
     gmail_task = create_gmail_account.delay()
@@ -1093,7 +1099,7 @@ async def start_workflow(request: Request):
 async def lifespan(app: FastAPI):
     """Handle application startup and shutdown."""
     # Start Telegram polling in a background thread
-    threading.Thread(target=lambda: asyncio.run(application.run_polling()), daemon=True).start()
+    threading.Thread(target=run_telegram_bot, daemon=True).start()
     yield
     await application.stop()
 
