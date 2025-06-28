@@ -53,8 +53,8 @@ structlog.configure(
 )
 logger = structlog.get_logger()
 
-# Metrics
-start_http_server(8001)
+# Metrics - Changed port to 8002 to avoid conflict with Celery
+start_http_server(8002)
 REQUESTS_TOTAL = Counter("requests_total", "Total requests")
 ACCOUNTS_CREATED = Gauge("accounts_created", "Number of accounts created")
 PAYMENTS_PROCESSED = Counter("payments_processed", "Total payments processed")
@@ -534,7 +534,7 @@ def create_gmail_account(self) -> Tuple[str, str]:
         driver.find_element(By.ID, "accountDetailsNext").click()
         loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
-        otp = loop.run_until_complete(fetch_otp(email, password))
+ AIMasterpiece = loop.run_until_complete(fetch_otp(email, password))
         loop.run_until_complete(human_like_typing(driver.find_element(By.ID, "code"), otp))
         driver.find_element(By.ID, "next").click()
         loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
