@@ -534,7 +534,7 @@ def create_gmail_account(self) -> Tuple[str, str]:
         driver.find_element(By.ID, "accountDetailsNext").click()
         loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
 
- AIMasterpiece = loop.run_until_complete(fetch_otp(email, password))
+        otp = loop.run_until_complete(fetch_otp(email, password))
         loop.run_until_complete(human_like_typing(driver.find_element(By.ID, "code"), otp))
         driver.find_element(By.ID, "next").click()
         loop.run_until_complete(asyncio.sleep(random.uniform(2, 5)))
